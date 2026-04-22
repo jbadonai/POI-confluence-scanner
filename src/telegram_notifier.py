@@ -80,15 +80,15 @@ class TelegramNotifier:
         tp_side = f"+{fp(tp_dist)} ({sig.tp_pips}pts)" if is_bull else f"-{fp(tp_dist)} ({sig.tp_pips}pts)"
 
         # Counter-trend warning banner (LENIENT mode)
-        ct       = getattr(sig, "counter_trend", False)
-        htf_tf   = getattr(sig, "htf_timeframe", "")
-        htf_trend= getattr(sig, "htf_trend", 0)
-        ct_line  = ""
+        ct        = getattr(sig, "counter_trend", False)
+        htf_tf    = getattr(sig, "htf_timeframe", "")
+        htf_trend = getattr(sig, "htf_trend", 0)
+        ct_line   = ""
         if ct and htf_tf:
-            htf_dir = "BULLISH" if htf_trend > 0 else "BEARISH"
+            htf_dir = "Uptrend" if htf_trend > 0 else "Downtrend"
             ct_line = (
                 f"\n⚠️ <b>COUNTER-TREND</b> — "
-                f"{htf_tf.upper()} trend is {htf_dir} "
+                f"HTF {htf_tf.upper()} is {htf_dir} "
                 f"(reduced RR 1:{sig.rr:.1f})"
             )
 

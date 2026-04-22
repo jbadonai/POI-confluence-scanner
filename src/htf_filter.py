@@ -1,36 +1,50 @@
 # -*- coding: utf-8 -*-
 """
-HTF (Higher Time Frame) Trend Filter — hardened against false flips.
+HTF Trend Filter — Ichimoku Cloud implementation.
 
-Trend detection upgrades applied
+Trend detection matches 1:1 the "ADVANCED TREND DETECTOR" section of the
+Pine Script (Entry Model - V2 - Simplified | Jbadonai).
+
+Pine Script source (key section)
 ---------------------------------
-1. Dual EMA  (fast + slow)  — structure confirmation, not just price
-2. EMA slope               — must be rising/falling, flat = neutral
-3. Consecutive closes       — N closes same side before committing
-4. ATR buffer zone          — ignores tiny EMA crosses (anti-whipsaw)
-5. Trend lock               — once in a trend, require strong opposite to flip
-6. Low-volatility filter    — neutral when market is not moving enough
+    tenkan_expr  = math.avg(ta.highest(9),  ta.lowest(9))
+    kijun_expr   = math.avg(ta.highest(26), ta.lowest(26))
+    senkouA_expr = math.avg(tenkan_expr, kijun_expr)[26]
+    senkouB_expr = math.avg(ta.highest(52), ta.lowest(52))[26]
 
-Trend states
-------------
-+1  Bullish   ALL of: EMA20>EMA50, close>EMA+buffer, slope rising, N closes above
--1  Bearish   ALL of: EMA20<EMA50, close<EMA-buffer, slope falling, N closes below
- 0  Neutral   Conditions not fully met (flat, choppy, buffer zone)
+    cloud_top    = math.max(senkouA, senkouB)
+    cloud_bottom = math.min(senkouA, senkouB)
 
-Trend lock
-----------
-Once +1 or -1 is established it persists until the OPPOSITE full condition
-is met for `trend_lock_candles` consecutive bars.  Single-bar reversals are
-ignored — the bot has memory.
+    trend = close > cloud_top    ? "Uptrend"
+          : close < cloud_bottom ? "Downtrend"
+          :                        "Ranging"
+
+Python translation
+------------------
+At the last confirmed bar (index n-1), the cloud values are derived from
+data 26 bars ago (the [26] displacement in Pine Script):
+
+    senkou_a[n-1] = (tenkan[n-27] + kijun[n-27]) / 2
+    senkou_b[n-1] = (highest_52[n-27] + lowest_52[n-27]) / 2
+
+Minimum bars needed: senkou_b_period(52) + displacement(26) = 78.
+
+Ranging market
+--------------
+When close is inside the cloud (Ranging), the trend is 0.
+By default skip_ranging = true, which treats 0 as a SKIP signal
+(same effect as STRICT mode for counter-trend, but reason says "Ranging").
 
 Policy
 ------
-STRICT  (strict=true)   counter-trend → skipped, Telegram failure if enabled
-LENIENT (strict=false)  counter-trend → allowed, TP reduced to counter_trend_rr
+STRICT  (strict=true)   counter-trend  -> skipped
+LENIENT (strict=false)  counter-trend  -> allowed, TP = counter_trend_rr
+BOTH modes: Ranging -> skipped when skip_ranging=true,
+                    -> pass-through (neutral) when skip_ranging=false
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -45,66 +59,78 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class HTFResult:
-    trend:          int    # +1 / -1 / 0
+    trend:          int      # +1 Uptrend / -1 Downtrend / 0 Ranging/neutral
+    trend_label:    str      # "Uptrend" / "Downtrend" / "Ranging" / "Disabled"
     with_trend:     bool
     counter_trend:  bool
+    ranging:        bool
     htf_close:      float
-    fast_ema:       float
-    slow_ema:       float
-    ema_slope:      float  # positive = rising, negative = falling
-    atr_value:      float
+    cloud_top:      float
+    cloud_bottom:   float
+    senkou_a:       float
+    senkou_b:       float
     htf_timeframe:  str
     skipped:        bool
+    skip_reason:    str      # why it was skipped (empty if not skipped)
     tp_rr_override: float
-    reason:         str    # human-readable explanation of trend decision
-
-
-@dataclass
-class _TrendState:
-    """Persistent per-symbol state across cycles (trend lock)."""
-    locked_trend:      int   = 0   # the currently locked trend
-    opposite_count:    int   = 0   # consecutive bars showing opposite signal
-    confirmed_bullish: int   = 0   # consecutive closes above EMA (pre-lock counter)
-    confirmed_bearish: int   = 0   # consecutive closes below EMA
 
 
 # ---------------------------------------------------------------------------
-# Indicator helpers
+# Ichimoku helpers — exact Pine Script equivalents
 # ---------------------------------------------------------------------------
 
-def _ema_series(closes: np.ndarray, period: int) -> np.ndarray:
+def _ichimoku(highs: np.ndarray, lows: np.ndarray,
+              tenkan_period: int, kijun_period: int,
+              senkou_b_period: int, displacement: int
+              ) -> Tuple[float, float, float, float]:
     """
-    Full EMA series using exponential smoothing seeded with SMA.
-    Returns array same length as closes (NaN for first period-1 values).
+    Compute Ichimoku cloud values for the LAST confirmed bar.
+
+    Pine Script equivalents
+    -----------------------
+    tenkan_expr  = math.avg(ta.highest(tenkan_period), ta.lowest(tenkan_period))
+    kijun_expr   = math.avg(ta.highest(kijun_period),  ta.lowest(kijun_period))
+    senkouA_expr = math.avg(tenkan_expr, kijun_expr)[displacement]
+    senkouB_expr = math.avg(ta.highest(senkou_b_period),
+                            ta.lowest(senkou_b_period))[displacement]
+
+    The [displacement] in Pine means "look back displacement bars", so:
+      senkouA at bar i = avg(tenkan[i-d], kijun[i-d])
+      senkouB at bar i = avg(highest_sb[i-d], lowest_sb[i-d])
+
+    Returns (tenkan, kijun, senkou_a, senkou_b) for the last bar.
     """
-    n   = len(closes)
-    out = np.full(n, np.nan)
-    if n < period:
-        return out
-    k        = 2.0 / (period + 1)
-    out[period - 1] = closes[:period].mean()
-    for i in range(period, n):
-        out[i] = closes[i] * k + out[i - 1] * (1 - k)
-    return out
+    n = len(highs)
+    d = displacement
 
+    # Current tenkan / kijun (for display info only — not used in cloud)
+    t_hi = np.max(highs[n - tenkan_period:])
+    t_lo = np.min(lows[n  - tenkan_period:])
+    tenkan = (t_hi + t_lo) / 2.0
 
-def _atr(highs: np.ndarray, lows: np.ndarray,
-         closes: np.ndarray, period: int) -> float:
-    """Wilder ATR — returns the last valid value."""
-    n  = len(closes)
-    tr = np.empty(n)
-    tr[0] = highs[0] - lows[0]
-    for i in range(1, n):
-        tr[i] = max(highs[i] - lows[i],
-                    abs(highs[i]  - closes[i - 1]),
-                    abs(lows[i]   - closes[i - 1]))
-    if n < period:
-        return float(tr.mean())
-    val = float(tr[:period].mean())
-    alpha = 1.0 / period
-    for i in range(period, n):
-        val = val * (1 - alpha) + tr[i] * alpha
-    return val
+    k_hi = np.max(highs[n - kijun_period:])
+    k_lo = np.min(lows[n  - kijun_period:])
+    kijun = (k_hi + k_lo) / 2.0
+
+    # Cloud values derived from d bars ago
+    # tenkan d bars ago
+    t_hi_d = np.max(highs[n - d - tenkan_period: n - d])
+    t_lo_d = np.min(lows[n  - d - tenkan_period: n - d])
+    tenkan_d = (t_hi_d + t_lo_d) / 2.0
+
+    # kijun d bars ago
+    k_hi_d = np.max(highs[n - d - kijun_period: n - d])
+    k_lo_d = np.min(lows[n  - d - kijun_period: n - d])
+    kijun_d = (k_hi_d + k_lo_d) / 2.0
+
+    senkou_a = (tenkan_d + kijun_d) / 2.0
+
+    # senkou B: highest/lowest of senkou_b_period, d bars ago
+    sb_hi = np.max(highs[n - d - senkou_b_period: n - d])
+    sb_lo = np.min(lows[n  - d - senkou_b_period: n - d])
+    senkou_b = (sb_hi + sb_lo) / 2.0
+
+    return tenkan, kijun, senkou_a, senkou_b
 
 
 # ---------------------------------------------------------------------------
@@ -112,12 +138,10 @@ def _atr(highs: np.ndarray, lows: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def _fetch_htf(symbol: str, htf_tf: str, limit: int,
-               base_url: str) -> Optional[Tuple[np.ndarray, np.ndarray,
-                                                np.ndarray, np.ndarray]]:
+               base_url: str) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """
     Fetch HTF OHLC from Binance.
-    Returns (opens, highs, lows, closes) of CONFIRMED bars (last bar excluded).
-    Returns None on failure.
+    Returns (highs, lows, closes) of CONFIRMED bars (last forming bar excluded).
     """
     try:
         r = requests.get(
@@ -132,11 +156,10 @@ def _fetch_htf(symbol: str, htf_tf: str, limit: int,
         if not data or len(data) < 3:
             return None
         rows   = data[:-1]   # exclude forming candle
-        opens  = np.array([float(row[1]) for row in rows])
         highs  = np.array([float(row[2]) for row in rows])
         lows   = np.array([float(row[3]) for row in rows])
         closes = np.array([float(row[4]) for row in rows])
-        return opens, highs, lows, closes
+        return highs, lows, closes
     except Exception as e:
         logger.warning(f"[HTF {symbol}] fetch error: {e}")
         return None
@@ -148,46 +171,45 @@ def _fetch_htf(symbol: str, htf_tf: str, limit: int,
 
 class HTFFilter:
     """
-    Per-scanner-instance HTF filter.
+    Per-scanner-instance Ichimoku-based HTF filter.
 
-    reset_cache()  — call at start of each cycle (clears price data cache)
-    check()        — evaluate a signal; returns HTFResult
+    reset_cache() — call at start of each cycle
+    check()       — evaluate a signal, returns HTFResult
     """
 
     def __init__(self, cfg: dict):
-        self.cfg    = cfg
-        self._enabled        = cfg.get("htf_enabled", False)
-        self._strict         = cfg.get("htf_strict", True)
-        self._htf_tf         = cfg.get("htf_timeframe", "1h")
-        self._fast_period    = int(cfg.get("htf_fast_ema", 20))
-        self._slow_period    = int(cfg.get("htf_slow_ema", 50))
-        self._confirm        = int(cfg.get("htf_confirm_candles", 2))
-        self._lock_candles   = int(cfg.get("htf_trend_lock_candles", 3))
-        self._atr_mult       = float(cfg.get("htf_atr_buffer_mult", 0.1))
-        self._min_atr_pct    = float(cfg.get("htf_min_atr_pct", 0.002))  # 0.2% min volatility
-        self._ct_rr          = float(cfg.get("htf_counter_trend_rr", 0.5))
-        self._base_url       = cfg.get("binance_base_url", "https://api1.binance.com")
+        self._enabled          = cfg.get("htf_enabled",          False)
+        self._strict           = cfg.get("htf_strict",           True)
+        self._htf_tf           = cfg.get("htf_timeframe",        "1h")
+        self._tenkan           = int(cfg.get("htf_tenkan",        9))
+        self._kijun            = int(cfg.get("htf_kijun",         26))
+        self._senkou_b         = int(cfg.get("htf_senkou_b",      52))
+        self._displacement     = int(cfg.get("htf_displacement",  26))
+        self._skip_ranging     = cfg.get("htf_skip_ranging",      True)
+        self._ct_rr            = float(cfg.get("htf_counter_trend_rr", 0.5))
+        self._base_url         = cfg.get("binance_base_url",
+                                         "https://api1.binance.com")
 
-        # Bars needed: slow EMA needs most, plus room for confirmation + lock
-        self._bars_needed = self._slow_period + self._lock_candles + 10
+        # Bars needed: senkou_b_period + displacement + safety buffer
+        self._bars_needed = self._senkou_b + self._displacement + 10
 
-        # Per-symbol persistent trend state (survives cycle resets)
-        self._states: Dict[str, _TrendState] = {}
-
-        # Per-cycle price data cache (reset each cycle)
-        self._cache: Dict[str, Optional[HTFResult]] = {}
+        # Per-symbol cycle cache (cleared each cycle)
+        self._cache: Dict[str, HTFResult] = {}
 
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
 
     def reset_cache(self):
-        """Call at the start of each scan cycle to force fresh HTF data."""
+        """Clear per-cycle data cache — call at the start of each scan cycle."""
         self._cache.clear()
 
     def check(self, symbol: str, signal_direction: int,
               signal_rr: float) -> HTFResult:
-        """Evaluate a signal against the HTF trend."""
+        """
+        Evaluate a signal against the HTF Ichimoku trend.
+        Returns an HTFResult — never raises.
+        """
         if not self._enabled:
             return self._passthrough(signal_rr)
 
@@ -196,191 +218,164 @@ class HTFFilter:
 
         result = self._cache[symbol]
         if result is None:
-            # Data unavailable — don't block
             return self._passthrough(signal_rr,
                                      reason="HTF data unavailable — filter bypassed")
 
         return self._apply_policy(result, signal_direction, signal_rr)
 
     # -------------------------------------------------------------------------
-    # Trend computation
+    # Ichimoku computation
     # -------------------------------------------------------------------------
 
     def _compute(self, symbol: str) -> Optional[HTFResult]:
-        """Fetch HTF data and compute trend for symbol."""
-        ohlc = _fetch_htf(symbol, self._htf_tf, self._bars_needed, self._base_url)
+        """Fetch HTF bars and compute Ichimoku cloud trend."""
+        ohlc = _fetch_htf(symbol, self._htf_tf,
+                          self._bars_needed, self._base_url)
         if ohlc is None:
             return None
 
-        opens, highs, lows, closes = ohlc
+        highs, lows, closes = ohlc
         n = len(closes)
-        if n < self._slow_period + 2:
-            logger.warning(f"[HTF {symbol}] too few bars ({n}), need {self._slow_period+2}")
+        min_needed = self._senkou_b + self._displacement + self._kijun
+        if n < min_needed:
+            logger.warning(f"[HTF {symbol}] only {n} bars, need {min_needed}")
             return None
 
-        # ── Indicators ────────────────────────────────────────────────────────
-        fast_ema = _ema_series(closes, self._fast_period)
-        slow_ema = _ema_series(closes, self._slow_period)
-        atr_val  = _atr(highs, lows, closes, 14)
-
-        last_fast  = float(fast_ema[-1])
-        last_slow  = float(slow_ema[-1])
-        prev_fast  = float(fast_ema[-2])
-        last_close = float(closes[-1])
-        buffer     = atr_val * self._atr_mult
-
-        # EMA slope: positive = rising, negative = falling
-        slope = last_fast - prev_fast
-
-        # Low-volatility guard: if ATR < min_atr_pct of price, market is flat
-        atr_pct = atr_val / last_close if last_close > 0 else 0
-        low_vol = atr_pct < self._min_atr_pct
-
-        # ── Per-symbol trend lock state ────────────────────────────────────────
-        state = self._states.setdefault(symbol, _TrendState())
-
-        # Count consecutive closes above / below fast EMA
-        above_ema = last_close > (last_fast + buffer)
-        below_ema = last_close < (last_fast - buffer)
-
-        if above_ema:
-            state.confirmed_bullish += 1
-            state.confirmed_bearish  = 0
-        elif below_ema:
-            state.confirmed_bearish += 1
-            state.confirmed_bullish  = 0
-        else:
-            # Inside buffer zone — neither counter accumulates
-            state.confirmed_bullish = max(0, state.confirmed_bullish - 1)
-            state.confirmed_bearish = max(0, state.confirmed_bearish - 1)
-
-        # ── Raw trend signal (all conditions required) ─────────────────────────
-        bull_conditions = (
-            last_fast > last_slow          # dual EMA structure
-            and above_ema                  # close above EMA + buffer
-            and slope > 0                  # EMA rising
-            and state.confirmed_bullish >= self._confirm  # N consecutive
-            and not low_vol                # market is moving
-        )
-        bear_conditions = (
-            last_fast < last_slow
-            and below_ema
-            and slope < 0
-            and state.confirmed_bearish >= self._confirm
-            and not low_vol
+        # Compute Ichimoku values
+        tenkan, kijun, senkou_a, senkou_b = _ichimoku(
+            highs, lows,
+            self._tenkan, self._kijun,
+            self._senkou_b, self._displacement,
         )
 
-        raw_trend = +1 if bull_conditions else -1 if bear_conditions else 0
+        last_close  = float(closes[-1])
+        cloud_top    = max(senkou_a, senkou_b)
+        cloud_bottom = min(senkou_a, senkou_b)
 
-        # ── Trend lock ─────────────────────────────────────────────────────────
-        if state.locked_trend == 0:
-            # No established trend — adopt raw signal immediately
-            if raw_trend != 0:
-                state.locked_trend   = raw_trend
-                state.opposite_count = 0
-        elif raw_trend == -state.locked_trend:
-            # Opposite signal building — increment counter
-            state.opposite_count += 1
-            if state.opposite_count >= self._lock_candles:
-                # Strong enough flip — adopt the new trend
-                state.locked_trend   = raw_trend
-                state.opposite_count = 0
-            # else: keep existing locked trend (ignore weak reversal)
+        # Pine Script 1:1 trend logic
+        if last_close > cloud_top:
+            trend = +1
+            label = "Uptrend"
+        elif last_close < cloud_bottom:
+            trend = -1
+            label = "Downtrend"
         else:
-            # Same direction or neutral — reset opposite counter
-            state.opposite_count = 0
-            if raw_trend != 0:
-                state.locked_trend = raw_trend
+            trend = 0
+            label = "Ranging"
 
-        trend = state.locked_trend
-
-        # ── Build explanation ──────────────────────────────────────────────────
-        trend_str = "BULLISH" if trend > 0 else "BEARISH" if trend < 0 else "NEUTRAL"
-        reason_parts = [
-            f"EMA{self._fast_period}={last_fast:.5f}",
-            f"EMA{self._slow_period}={last_slow:.5f}",
-            f"slope={'rising' if slope > 0 else 'falling' if slope < 0 else 'flat'}",
-            f"buf={buffer:.5f}",
-            f"consec_bull={state.confirmed_bullish}",
-            f"consec_bear={state.confirmed_bearish}",
-            f"lock={state.locked_trend}",
-            f"low_vol={low_vol}",
-        ]
-        reason = f"{self._htf_tf.upper()} {trend_str} — {' | '.join(reason_parts)}"
-        logger.debug(f"[HTF {symbol}] {reason}")
+        logger.debug(
+            f"[HTF {symbol}] {self._htf_tf.upper()} "
+            f"close={last_close:.5f}  "
+            f"cloud_top={cloud_top:.5f}  "
+            f"cloud_bottom={cloud_bottom:.5f}  "
+            f"senkou_a={senkou_a:.5f}  "
+            f"senkou_b={senkou_b:.5f}  "
+            f"trend={label}"
+        )
 
         return HTFResult(
-            trend=trend,
-            with_trend=False,       # filled by _apply_policy
-            counter_trend=False,
+            trend=trend, trend_label=label,
+            with_trend=False, counter_trend=False, ranging=(trend == 0),
             htf_close=last_close,
-            fast_ema=last_fast,
-            slow_ema=last_slow,
-            ema_slope=slope,
-            atr_value=atr_val,
+            cloud_top=cloud_top, cloud_bottom=cloud_bottom,
+            senkou_a=senkou_a, senkou_b=senkou_b,
             htf_timeframe=self._htf_tf,
-            skipped=False,
+            skipped=False, skip_reason="",
             tp_rr_override=signal_rr,
-            reason=reason,
         )
 
     # -------------------------------------------------------------------------
-    # Policy application
+    # Policy
     # -------------------------------------------------------------------------
 
     def _apply_policy(self, base: HTFResult,
                       signal_direction: int,
                       signal_rr: float) -> HTFResult:
-        """Determine with_trend / counter_trend and apply STRICT / LENIENT."""
+        """Apply STRICT / LENIENT / ranging policy to a computed HTFResult."""
         trend = base.trend
 
+        # Ranging market
         if trend == 0:
-            # Neutral / flat market — pass through unchanged
-            return self._clone(base, with_trend=True, counter_trend=False,
-                               skipped=False, tp_rr_override=signal_rr)
+            if self._skip_ranging:
+                return self._clone(base,
+                                   skipped=True,
+                                   skip_reason=(
+                                       f"Ranging market — price inside "
+                                       f"Ichimoku cloud "
+                                       f"(top={base.cloud_top:.5f}  "
+                                       f"bottom={base.cloud_bottom:.5f})"
+                                   ),
+                                   tp_rr_override=signal_rr)
+            else:
+                # Treat ranging as neutral — pass through unchanged
+                return self._clone(base,
+                                   with_trend=True, counter_trend=False,
+                                   skipped=False, skip_reason="",
+                                   tp_rr_override=signal_rr)
 
+        # Trending market
         with_trend    = (signal_direction == trend)
         counter_trend = not with_trend
+        d_str         = "LONG" if signal_direction > 0 else "SHORT"
+        trend_str     = base.trend_label
 
         if with_trend:
-            return self._clone(base, with_trend=True, counter_trend=False,
-                               skipped=False, tp_rr_override=signal_rr)
+            return self._clone(base,
+                               with_trend=True, counter_trend=False,
+                               skipped=False, skip_reason="",
+                               tp_rr_override=signal_rr)
 
-        # Counter-trend signal
+        # Counter-trend
         if self._strict:
-            return self._clone(base, with_trend=False, counter_trend=True,
-                               skipped=True, tp_rr_override=signal_rr)
+            reason = (
+                f"Counter-trend: signal is {d_str} but "
+                f"HTF {self._htf_tf.upper()} is {trend_str} "
+                f"(close={base.htf_close:.5f}  "
+                f"cloud_top={base.cloud_top:.5f}  "
+                f"cloud_bottom={base.cloud_bottom:.5f})"
+            )
+            return self._clone(base,
+                               with_trend=False, counter_trend=True,
+                               skipped=True, skip_reason=reason,
+                               tp_rr_override=signal_rr)
         else:
-            return self._clone(base, with_trend=False, counter_trend=True,
-                               skipped=False, tp_rr_override=self._ct_rr)
+            # LENIENT: allow with reduced TP
+            return self._clone(base,
+                               with_trend=False, counter_trend=True,
+                               skipped=False, skip_reason="",
+                               tp_rr_override=self._ct_rr)
 
     # -------------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------------
 
-    def _passthrough(self, signal_rr: float, reason: str = "HTF filter disabled") -> HTFResult:
+    def _passthrough(self, signal_rr: float,
+                     reason: str = "HTF filter disabled") -> HTFResult:
         return HTFResult(
-            trend=0, with_trend=True, counter_trend=False,
-            htf_close=0.0, fast_ema=0.0, slow_ema=0.0,
-            ema_slope=0.0, atr_value=0.0,
+            trend=0, trend_label="Disabled",
+            with_trend=True, counter_trend=False, ranging=False,
+            htf_close=0.0, cloud_top=0.0, cloud_bottom=0.0,
+            senkou_a=0.0, senkou_b=0.0,
             htf_timeframe=self._htf_tf,
-            skipped=False, tp_rr_override=signal_rr,
-            reason=reason,
+            skipped=False, skip_reason=reason,
+            tp_rr_override=signal_rr,
         )
 
     @staticmethod
-    def _clone(base: HTFResult, **overrides) -> HTFResult:
+    def _clone(base: HTFResult, **kw) -> HTFResult:
         return HTFResult(
-            trend          = overrides.get("trend",          base.trend),
-            with_trend     = overrides.get("with_trend",     base.with_trend),
-            counter_trend  = overrides.get("counter_trend",  base.counter_trend),
+            trend          = kw.get("trend",          base.trend),
+            trend_label    = kw.get("trend_label",    base.trend_label),
+            with_trend     = kw.get("with_trend",     base.with_trend),
+            counter_trend  = kw.get("counter_trend",  base.counter_trend),
+            ranging        = kw.get("ranging",        base.ranging),
             htf_close      = base.htf_close,
-            fast_ema       = base.fast_ema,
-            slow_ema       = base.slow_ema,
-            ema_slope      = base.ema_slope,
-            atr_value      = base.atr_value,
+            cloud_top      = base.cloud_top,
+            cloud_bottom   = base.cloud_bottom,
+            senkou_a       = base.senkou_a,
+            senkou_b       = base.senkou_b,
             htf_timeframe  = base.htf_timeframe,
-            skipped        = overrides.get("skipped",        base.skipped),
-            tp_rr_override = overrides.get("tp_rr_override", base.tp_rr_override),
-            reason         = base.reason,
+            skipped        = kw.get("skipped",        base.skipped),
+            skip_reason    = kw.get("skip_reason",    base.skip_reason),
+            tp_rr_override = kw.get("tp_rr_override", base.tp_rr_override),
         )

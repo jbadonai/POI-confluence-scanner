@@ -58,8 +58,9 @@ class Scanner:
         if htf_on:
             logger.info(f"HTF filter: ENABLED  "
                         f"TF={cfg.get('htf_timeframe','1h')}  "
-                        f"EMA({cfg.get('htf_ema_period',20)})  "
-                        f"mode={htf_mode}")
+                        f"method=Ichimoku Cloud  "
+                        f"mode={htf_mode}  "
+                        f"skip_ranging={cfg.get('htf_skip_ranging',True)}")
         else:
             logger.info("HTF filter: DISABLED")
 
@@ -158,12 +159,7 @@ class Scanner:
                 htf = self._htf.check(sym, sig.direction, sig.rr)
 
                 if htf.skipped:
-                    # STRICT mode: counter-trend signal blocked
-                    trend_str = "BULL" if htf.trend > 0 else "BEAR"
-                    reason = (f"Counter-trend: signal is {d_str} but "
-                              f"HTF {htf.htf_timeframe} trend is {trend_str} "
-                              f"(close={htf.htf_close:.5f} "
-                              f"EMA={htf.ema_value:.5f})")
+                    reason = htf.skip_reason
                     logger.info(f"  [HTF] {sym} SKIPPED — {reason}")
                     if self.cfg.get("bybit_notify_failures", True):
                         await self._notify_failure(sig, reason)

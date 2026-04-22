@@ -118,17 +118,16 @@ def load_config(path: str = 'config.ini') -> Dict[str, Any]:
         'ps_min_lot':   f('POSITION_SIZING', 'min_lot', 0.001),
         'ps_lot_step':  f('POSITION_SIZING', 'lot_step', 0.001),
 
-        # -- HTF trend filter --------------------------------------------------
-        'htf_enabled':             b('HTF_FILTER', 'enabled',            False),
-        'htf_strict':              b('HTF_FILTER', 'strict',             True),
-        'htf_timeframe':           s('HTF_FILTER', 'timeframe',          '1h'),
-        'htf_fast_ema':            i('HTF_FILTER', 'fast_ema',           20),
-        'htf_slow_ema':            i('HTF_FILTER', 'slow_ema',           50),
-        'htf_confirm_candles':     i('HTF_FILTER', 'confirm_candles',    2),
-        'htf_atr_buffer_mult':     f('HTF_FILTER', 'atr_buffer_mult',    0.1),
-        'htf_trend_lock_candles':  i('HTF_FILTER', 'trend_lock_candles', 3),
-        'htf_min_atr_pct':         f('HTF_FILTER', 'min_atr_pct',        0.002),
-        'htf_counter_trend_rr':    f('HTF_FILTER', 'counter_trend_rr',   0.5),
+        # -- HTF trend filter (Ichimoku Cloud) ---------------------------------
+        'htf_enabled':          b('HTF_FILTER', 'enabled',          False),
+        'htf_strict':           b('HTF_FILTER', 'strict',           True),
+        'htf_timeframe':        s('HTF_FILTER', 'timeframe',        '1h'),
+        'htf_tenkan':           i('HTF_FILTER', 'tenkan_period',    9),
+        'htf_kijun':            i('HTF_FILTER', 'kijun_period',     26),
+        'htf_senkou_b':         i('HTF_FILTER', 'senkou_b_period',  52),
+        'htf_displacement':     i('HTF_FILTER', 'displacement',     26),
+        'htf_skip_ranging':     b('HTF_FILTER', 'skip_ranging',     True),
+        'htf_counter_trend_rr': f('HTF_FILTER', 'counter_trend_rr', 0.5),
 
         # -- Scanner -----------------------------------------------------------
         'interval_seconds':        auto_interval,   # always = timeframe in seconds (e.g. 5m -> 300)
