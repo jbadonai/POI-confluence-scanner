@@ -49,3 +49,6 @@ class SignalInfo:
     counter_trend:  bool  = False   # True when signal opposes HTF trend
     htf_trend:      int   = 0       # +1 bull / -1 bear / 0 neutral / disabled
     htf_timeframe:  str   = ""      # e.g. "1h"
+    # POI zone coordinates: list of (label, top, bottom) tuples
+    # e.g. [("OB", 1.3320, 1.3310), ("LS", 1.3325, 1.3308)]
+    zone_coords:    object = None  # list of (label, top, bottom) or None

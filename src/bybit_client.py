@@ -249,64 +249,71 @@ class BybitClient:
             return False
 
     # -------------------------------------------------------------------------
-    # Leverage
+    # Leverage — always use maximum, gracefully handles already-set errors
     # -------------------------------------------------------------------------
 
-    def ensure_leverage(self, symbol: str, leverage: int) -> bool:
+    def set_max_leverage(self, symbol: str, max_leverage: int) -> bool:
         """
-        Set buy+sell leverage for symbol in Hedge Mode.
-        Returns True on success (including already-set case).
+        Set buy+sell leverage to max_leverage for symbol in Hedge Mode.
+
+        Gracefully handles:
+        - 110043: leverage already set to this value (treated as success)
+        - Any other Bybit error: logged, returns False (trade blocked)
+
+        Uses a process-lifetime cache so each symbol is set only once per run.
         """
-        if self._leverage_cache.get(symbol) == leverage:
+        cached = self._leverage_cache.get(symbol)
+        if cached == max_leverage:
+            logger.debug(f"[{symbol}] Leverage already confirmed at {max_leverage}x (cached)")
             return True
         try:
             self._post("/v5/position/set-leverage", {
-                "category":    "linear",
-                "symbol":      symbol,
-                "buyLeverage": str(leverage),
-                "sellLeverage": str(leverage),
+                "category":     "linear",
+                "symbol":       symbol,
+                "buyLeverage":  str(max_leverage),
+                "sellLeverage": str(max_leverage),
             })
-            self._leverage_cache[symbol] = leverage
-            logger.info(f"[{symbol}] Leverage set to {leverage}x")
+            self._leverage_cache[symbol] = max_leverage
+            logger.info(f"[{symbol}] Max leverage set to {max_leverage}x")
             return True
         except RuntimeError as e:
-            # Error code 110043 = already at this leverage
-            if "110043" in str(e):
-                self._leverage_cache[symbol] = leverage
-                logger.debug(f"[{symbol}] Leverage already at {leverage}x")
+            err_str = str(e)
+            if "110043" in err_str:
+                # Already at this leverage — not an error, cache and continue
+                self._leverage_cache[symbol] = max_leverage
+                logger.info(f"[{symbol}] Max leverage already at {max_leverage}x")
                 return True
+            if "110044" in err_str:
+                # Leverage not modified (same value) — also fine
+                self._leverage_cache[symbol] = max_leverage
+                logger.info(f"[{symbol}] Leverage unchanged at {max_leverage}x")
+                return True
+            # Genuine error — log and block the trade
             logger.error(f"[{symbol}] set-leverage failed: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"[{symbol}] set-leverage unexpected error: {e}")
             return False
 
     # -------------------------------------------------------------------------
-    # Position sizing
+    # Order value sizing
     # -------------------------------------------------------------------------
 
-    def calc_notional(self, cfg: dict, sl_pct: float) -> float:
+    def get_order_value(self, symbol: str) -> Tuple[int, float]:
         """
-        Compute position notional in USDT.
+        Determine max leverage and order value for a symbol.
 
-        FIXED_RISK:  notional = risk_usd / sl_pct
-        PCT_BALANCE: notional = (balance * pct / 100) / sl_pct
+        Order value (USDT notional) = floor(max_leverage / 2)
+        e.g. max_leverage=100 -> order_value=50 USDT
+             max_leverage=75  -> order_value=37 USDT (floor)
+
+        Returns (max_leverage, order_value_usdt).
         """
-        if sl_pct <= 0:
-            raise ValueError(f"sl_pct must be > 0, got {sl_pct}")
-
-        mode = cfg.get("bybit_sizing_mode", "FIXED_RISK").upper()
-
-        if mode == "PCT_BALANCE":
-            balance  = self.get_balance()
-            pct      = float(cfg.get("bybit_pct_balance", 2.0))
-            notional = (balance * pct / 100.0) / sl_pct
-            logger.info(f"  Sizing PCT_BALANCE: balance={balance:.2f} "
-                        f"pct={pct}% sl_pct={sl_pct:.4%} -> notional={notional:.2f} USDT")
-        else:
-            risk_usd = float(cfg.get("bybit_risk_usd", 50.0))
-            notional = risk_usd / sl_pct
-            logger.info(f"  Sizing FIXED_RISK: risk={risk_usd} USDT "
-                        f"sl_pct={sl_pct:.4%} -> notional={notional:.2f} USDT")
-
-        return notional
+        max_lev     = self.get_max_leverage(symbol)
+        order_value = math.floor(max_lev / 2.0)
+        logger.info(f"[{symbol}] max_leverage={max_lev}x  "
+                    f"order_value={order_value} USDT")
+        return max_lev, float(order_value)
 
     # -------------------------------------------------------------------------
     # Order placement

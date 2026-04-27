@@ -1,46 +1,44 @@
 # -*- coding: utf-8 -*-
 """
-HTF Trend Filter — Ichimoku Cloud implementation.
+HTF Trend Filter — Ichimoku Cloud matching Pine Script ATD exactly.
 
-Trend detection matches 1:1 the "ADVANCED TREND DETECTOR" section of the
-Pine Script (Entry Model - V2 - Simplified | Jbadonai).
+Data source fix
+---------------
+The original version fetched Binance spot data for the HTF calculation.
+TradingView (and Bybit traders) see Bybit PERPETUAL prices, which can differ
+from Binance spot by 0.1-2% on altcoins — enough to flip the cloud comparison.
 
-Pine Script source (key section)
----------------------------------
+This version fetches HTF klines from BYBIT's public API (same data as TradingView
+BYBIT:SYMBOL.P charts), with Binance as fallback if Bybit fetch fails.
+
+Pine Script source (ADVANCED TREND DETECTOR section)
+-----------------------------------------------------
     tenkan_expr  = math.avg(ta.highest(9),  ta.lowest(9))
     kijun_expr   = math.avg(ta.highest(26), ta.lowest(26))
     senkouA_expr = math.avg(tenkan_expr, kijun_expr)[26]
     senkouB_expr = math.avg(ta.highest(52), ta.lowest(52))[26]
+    close_expr   = close
 
+    [senkouA, senkouB, close_val] = request.security(ticker, tf, [...])
     cloud_top    = math.max(senkouA, senkouB)
     cloud_bottom = math.min(senkouA, senkouB)
-
-    trend = close > cloud_top    ? "Uptrend"
-          : close < cloud_bottom ? "Downtrend"
-          :                        "Ranging"
+    trend = close_val > cloud_top    ? "Uptrend"
+          : close_val < cloud_bottom ? "Downtrend"
+                                     : "Ranging"
 
 Python translation
 ------------------
-At the last confirmed bar (index n-1), the cloud values are derived from
-data 26 bars ago (the [26] displacement in Pine Script):
+request.security with barmerge.lookahead_off returns values from the last
+CONFIRMED HTF bar. The [26] displacement means 26 HTF bars ago.
 
-    senkou_a[n-1] = (tenkan[n-27] + kijun[n-27]) / 2
-    senkou_b[n-1] = (highest_52[n-27] + lowest_52[n-27]) / 2
+At last confirmed bar T (index n-1, 0-based):
+  tenkan(T-26)  = avg(max(highs[n-35 : n-26]), min(lows[n-35 : n-26]))
+  kijun(T-26)   = avg(max(highs[n-52 : n-26]), min(lows[n-52 : n-26]))
+  senkouA       = avg(tenkan(T-26), kijun(T-26))
+  senkouB(T-26) = avg(max(highs[n-78 : n-26]), min(lows[n-78 : n-26]))
+  compare: closes[n-1] vs max/min(senkouA, senkouB)
 
-Minimum bars needed: senkou_b_period(52) + displacement(26) = 78.
-
-Ranging market
---------------
-When close is inside the cloud (Ranging), the trend is 0.
-By default skip_ranging = true, which treats 0 as a SKIP signal
-(same effect as STRICT mode for counter-trend, but reason says "Ranging").
-
-Policy
-------
-STRICT  (strict=true)   counter-trend  -> skipped
-LENIENT (strict=false)  counter-trend  -> allowed, TP = counter_trend_rr
-BOTH modes: Ranging -> skipped when skip_ranging=true,
-                    -> pass-through (neutral) when skip_ranging=false
+Minimum bars needed: 52 + 26 + 1 = 79. We request 90 for safety.
 """
 
 import logging
@@ -52,6 +50,13 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+# Bybit interval mapping from our timeframe format strings
+_BYBIT_INTERVAL = {
+    '1m': '1', '3m': '3', '5m': '5', '15m': '15', '30m': '30',
+    '1h': '60', '2h': '120', '4h': '240', '6h': '360', '12h': '720',
+    '1d': 'D', '1w': 'W',
+}
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -59,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class HTFResult:
-    trend:          int      # +1 Uptrend / -1 Downtrend / 0 Ranging/neutral
+    trend:          int      # +1 Uptrend / -1 Downtrend / 0 Ranging
     trend_label:    str      # "Uptrend" / "Downtrend" / "Ranging" / "Disabled"
     with_trend:     bool
     counter_trend:  bool
@@ -71,98 +76,141 @@ class HTFResult:
     senkou_b:       float
     htf_timeframe:  str
     skipped:        bool
-    skip_reason:    str      # why it was skipped (empty if not skipped)
+    skip_reason:    str
     tp_rr_override: float
 
 
 # ---------------------------------------------------------------------------
-# Ichimoku helpers — exact Pine Script equivalents
+# Ichimoku computation — exact Pine Script match
 # ---------------------------------------------------------------------------
 
-def _ichimoku(highs: np.ndarray, lows: np.ndarray,
-              tenkan_period: int, kijun_period: int,
-              senkou_b_period: int, displacement: int
-              ) -> Tuple[float, float, float, float]:
+def _ichimoku_at_last_bar(highs: np.ndarray, lows: np.ndarray,
+                           tenkan_p: int, kijun_p: int,
+                           senkou_b_p: int, displacement: int
+                           ) -> Tuple[float, float, float, float]:
     """
-    Compute Ichimoku cloud values for the LAST confirmed bar.
+    Compute Ichimoku cloud values at the last confirmed bar.
 
-    Pine Script equivalents
-    -----------------------
-    tenkan_expr  = math.avg(ta.highest(tenkan_period), ta.lowest(tenkan_period))
-    kijun_expr   = math.avg(ta.highest(kijun_period),  ta.lowest(kijun_period))
-    senkouA_expr = math.avg(tenkan_expr, kijun_expr)[displacement]
-    senkouB_expr = math.avg(ta.highest(senkou_b_period),
-                            ta.lowest(senkou_b_period))[displacement]
+    Pine Script mapping (T = last confirmed bar = index n-1, D = displacement = 26):
+      tenkan(T-D)  = avg(max(highs[T-D .. T-D-tenkan_p+1]),
+                         min(lows [T-D .. T-D-tenkan_p+1]))
+                   = avg(max(highs[n-D-tenkan_p : n-D]),
+                         min(lows [n-D-tenkan_p : n-D]))
 
-    The [displacement] in Pine means "look back displacement bars", so:
-      senkouA at bar i = avg(tenkan[i-d], kijun[i-d])
-      senkouB at bar i = avg(highest_sb[i-d], lowest_sb[i-d])
+      kijun(T-D)   = avg(max(highs[n-D-kijun_p : n-D]),
+                         min(lows [n-D-kijun_p : n-D]))
 
-    Returns (tenkan, kijun, senkou_a, senkou_b) for the last bar.
+      senkouA      = avg(tenkan(T-D), kijun(T-D))
+
+      senkouB(T-D) = avg(max(highs[n-D-senkou_b_p : n-D]),
+                         min(lows [n-D-senkou_b_p : n-D]))
+
+    All slices end at index n-D (exclusive), which is bar T-D+1 in 0-based,
+    so the last bar INCLUDED is n-D-1 = T-D. This matches Pine Script's
+    ta.highest(N)[D] = max of bars [T-D, T-D-1, ..., T-D-N+1].
     """
     n = len(highs)
-    d = displacement
+    D = displacement
 
-    # Current tenkan / kijun (for display info only — not used in cloud)
-    t_hi = np.max(highs[n - tenkan_period:])
-    t_lo = np.min(lows[n  - tenkan_period:])
+    def hi(start, end): return float(np.max(highs[start:end]))
+    def lo(start, end): return float(np.min(lows [start:end]))
+
+    # tenkan at T-D
+    t_hi = hi(n - D - tenkan_p,   n - D)
+    t_lo = lo(n - D - tenkan_p,   n - D)
     tenkan = (t_hi + t_lo) / 2.0
 
-    k_hi = np.max(highs[n - kijun_period:])
-    k_lo = np.min(lows[n  - kijun_period:])
+    # kijun at T-D
+    k_hi = hi(n - D - kijun_p,    n - D)
+    k_lo = lo(n - D - kijun_p,    n - D)
     kijun = (k_hi + k_lo) / 2.0
 
-    # Cloud values derived from d bars ago
-    # tenkan d bars ago
-    t_hi_d = np.max(highs[n - d - tenkan_period: n - d])
-    t_lo_d = np.min(lows[n  - d - tenkan_period: n - d])
-    tenkan_d = (t_hi_d + t_lo_d) / 2.0
+    senkou_a = (tenkan + kijun) / 2.0
 
-    # kijun d bars ago
-    k_hi_d = np.max(highs[n - d - kijun_period: n - d])
-    k_lo_d = np.min(lows[n  - d - kijun_period: n - d])
-    kijun_d = (k_hi_d + k_lo_d) / 2.0
-
-    senkou_a = (tenkan_d + kijun_d) / 2.0
-
-    # senkou B: highest/lowest of senkou_b_period, d bars ago
-    sb_hi = np.max(highs[n - d - senkou_b_period: n - d])
-    sb_lo = np.min(lows[n  - d - senkou_b_period: n - d])
+    # senkouB at T-D
+    sb_hi = hi(n - D - senkou_b_p, n - D)
+    sb_lo = lo(n - D - senkou_b_p, n - D)
     senkou_b = (sb_hi + sb_lo) / 2.0
 
     return tenkan, kijun, senkou_a, senkou_b
 
 
 # ---------------------------------------------------------------------------
-# Binance HTF data fetch
+# Data fetchers
 # ---------------------------------------------------------------------------
 
-def _fetch_htf(symbol: str, htf_tf: str, limit: int,
-               base_url: str) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+def _fetch_bybit(symbol: str, htf_tf: str, limit: int,
+                 bybit_base: str) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """
-    Fetch HTF OHLC from Binance.
-    Returns (highs, lows, closes) of CONFIRMED bars (last forming bar excluded).
+    Fetch HTF klines from Bybit public API (same data as TradingView BYBIT charts).
+    Bybit returns data NEWEST FIRST — we reverse to oldest-first.
+    Excludes the forming (most recent) bar.
     """
+    interval = _BYBIT_INTERVAL.get(htf_tf)
+    if not interval:
+        logger.warning(f"[HTF] Unknown timeframe '{htf_tf}' for Bybit interval mapping")
+        return None
     try:
         r = requests.get(
-            f"{base_url}/api/v3/klines",
-            params={"symbol": symbol, "interval": htf_tf, "limit": limit + 1},
+            f"{bybit_base}/v5/market/kline",
+            params={"category": "linear", "symbol": symbol,
+                    "interval": interval, "limit": limit + 1},
             timeout=10,
         )
         if r.status_code != 200:
-            logger.warning(f"[HTF {symbol}] Binance HTTP {r.status_code}")
+            logger.debug(f"[HTF {symbol}] Bybit HTTP {r.status_code}")
             return None
         data = r.json()
-        if not data or len(data) < 3:
+        rows = data.get("result", {}).get("list", [])
+        if not rows or len(rows) < 3:
             return None
-        rows   = data[:-1]   # exclude forming candle
+        # Bybit: newest first → reverse to oldest first, then exclude last (forming)
+        rows = list(reversed(rows))[:-1]
         highs  = np.array([float(row[2]) for row in rows])
         lows   = np.array([float(row[3]) for row in rows])
         closes = np.array([float(row[4]) for row in rows])
         return highs, lows, closes
     except Exception as e:
-        logger.warning(f"[HTF {symbol}] fetch error: {e}")
+        logger.debug(f"[HTF {symbol}] Bybit fetch error: {e}")
         return None
+
+
+def _fetch_binance(symbol: str, htf_tf: str, limit: int,
+                   binance_base: str) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Fallback: fetch HTF klines from Binance."""
+    try:
+        r = requests.get(
+            f"{binance_base}/api/v3/klines",
+            params={"symbol": symbol, "interval": htf_tf, "limit": limit + 1},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not data or len(data) < 3:
+            return None
+        rows   = data[:-1]   # exclude forming candle (Binance: oldest first)
+        highs  = np.array([float(row[2]) for row in rows])
+        lows   = np.array([float(row[3]) for row in rows])
+        closes = np.array([float(row[4]) for row in rows])
+        return highs, lows, closes
+    except Exception as e:
+        logger.debug(f"[HTF {symbol}] Binance fallback error: {e}")
+        return None
+
+
+def _fetch_htf(symbol: str, htf_tf: str, limit: int,
+               bybit_base: str, binance_base: str
+               ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """
+    Fetch HTF data from Bybit first (matches TradingView BYBIT charts),
+    fall back to Binance if Bybit fails.
+    """
+    result = _fetch_bybit(symbol, htf_tf, limit, bybit_base)
+    if result is not None:
+        return result
+    logger.debug(f"[HTF {symbol}] Bybit fetch failed — trying Binance fallback")
+    return _fetch_binance(symbol, htf_tf, limit, binance_base)
 
 
 # ---------------------------------------------------------------------------
@@ -171,29 +219,29 @@ def _fetch_htf(symbol: str, htf_tf: str, limit: int,
 
 class HTFFilter:
     """
-    Per-scanner-instance Ichimoku-based HTF filter.
+    Ichimoku-based HTF trend filter.
+    Data fetched from Bybit (matches TradingView charts).
 
-    reset_cache() — call at start of each cycle
-    check()       — evaluate a signal, returns HTFResult
+    reset_cache() — call at start of each scan cycle.
+    check()       — evaluate a signal, returns HTFResult.
     """
 
     def __init__(self, cfg: dict):
-        self._enabled          = cfg.get("htf_enabled",          False)
-        self._strict           = cfg.get("htf_strict",           True)
-        self._htf_tf           = cfg.get("htf_timeframe",        "1h")
-        self._tenkan           = int(cfg.get("htf_tenkan",        9))
-        self._kijun            = int(cfg.get("htf_kijun",         26))
-        self._senkou_b         = int(cfg.get("htf_senkou_b",      52))
-        self._displacement     = int(cfg.get("htf_displacement",  26))
-        self._skip_ranging     = cfg.get("htf_skip_ranging",      True)
-        self._ct_rr            = float(cfg.get("htf_counter_trend_rr", 0.5))
-        self._base_url         = cfg.get("binance_base_url",
-                                         "https://api1.binance.com")
+        self._enabled      = cfg.get("htf_enabled",          False)
+        self._strict       = cfg.get("htf_strict",           True)
+        self._htf_tf       = cfg.get("htf_timeframe",        "1h")
+        self._tenkan       = int(cfg.get("htf_tenkan",        9))
+        self._kijun        = int(cfg.get("htf_kijun",         26))
+        self._senkou_b     = int(cfg.get("htf_senkou_b",      52))
+        self._displacement = int(cfg.get("htf_displacement",  26))
+        self._skip_ranging = cfg.get("htf_skip_ranging",      True)
+        self._ct_rr        = float(cfg.get("htf_counter_trend_rr", 0.5))
+        self._bybit_base   = cfg.get("bybit_base_url",        "https://api.bybit.com")
+        self._binance_base = cfg.get("binance_base_url",      "https://api1.binance.com")
 
-        # Bars needed: senkou_b_period + displacement + safety buffer
-        self._bars_needed = self._senkou_b + self._displacement + 10
+        # bars: senkouB(52) + displacement(26) + kijun(26) + buffer = 110
+        self._bars_needed  = self._senkou_b + self._displacement + self._kijun + 20
 
-        # Per-symbol cycle cache (cleared each cycle)
         self._cache: Dict[str, HTFResult] = {}
 
     # -------------------------------------------------------------------------
@@ -201,15 +249,10 @@ class HTFFilter:
     # -------------------------------------------------------------------------
 
     def reset_cache(self):
-        """Clear per-cycle data cache — call at the start of each scan cycle."""
         self._cache.clear()
 
     def check(self, symbol: str, signal_direction: int,
               signal_rr: float) -> HTFResult:
-        """
-        Evaluate a signal against the HTF Ichimoku trend.
-        Returns an HTFResult — never raises.
-        """
         if not self._enabled:
             return self._passthrough(signal_rr)
 
@@ -220,7 +263,6 @@ class HTFFilter:
         if result is None:
             return self._passthrough(signal_rr,
                                      reason="HTF data unavailable — filter bypassed")
-
         return self._apply_policy(result, signal_direction, signal_rr)
 
     # -------------------------------------------------------------------------
@@ -228,9 +270,8 @@ class HTFFilter:
     # -------------------------------------------------------------------------
 
     def _compute(self, symbol: str) -> Optional[HTFResult]:
-        """Fetch HTF bars and compute Ichimoku cloud trend."""
-        ohlc = _fetch_htf(symbol, self._htf_tf,
-                          self._bars_needed, self._base_url)
+        ohlc = _fetch_htf(symbol, self._htf_tf, self._bars_needed,
+                          self._bybit_base, self._binance_base)
         if ohlc is None:
             return None
 
@@ -241,36 +282,27 @@ class HTFFilter:
             logger.warning(f"[HTF {symbol}] only {n} bars, need {min_needed}")
             return None
 
-        # Compute Ichimoku values
-        tenkan, kijun, senkou_a, senkou_b = _ichimoku(
+        tenkan, kijun, senkou_a, senkou_b = _ichimoku_at_last_bar(
             highs, lows,
             self._tenkan, self._kijun,
             self._senkou_b, self._displacement,
         )
 
-        last_close  = float(closes[-1])
+        last_close   = float(closes[-1])
         cloud_top    = max(senkou_a, senkou_b)
         cloud_bottom = min(senkou_a, senkou_b)
 
-        # Pine Script 1:1 trend logic
-        if last_close > cloud_top:
-            trend = +1
-            label = "Uptrend"
-        elif last_close < cloud_bottom:
-            trend = -1
-            label = "Downtrend"
-        else:
-            trend = 0
-            label = "Ranging"
+        # 1:1 Pine Script ATD logic
+        if   last_close > cloud_top:    trend, label = +1, "Uptrend"
+        elif last_close < cloud_bottom: trend, label = -1, "Downtrend"
+        else:                           trend, label =  0, "Ranging"
 
         logger.debug(
             f"[HTF {symbol}] {self._htf_tf.upper()} "
             f"close={last_close:.5f}  "
             f"cloud_top={cloud_top:.5f}  "
             f"cloud_bottom={cloud_bottom:.5f}  "
-            f"senkou_a={senkou_a:.5f}  "
-            f"senkou_b={senkou_b:.5f}  "
-            f"trend={label}"
+            f"-> {label}"
         )
 
         return HTFResult(
@@ -281,7 +313,7 @@ class HTFFilter:
             senkou_a=senkou_a, senkou_b=senkou_b,
             htf_timeframe=self._htf_tf,
             skipped=False, skip_reason="",
-            tp_rr_override=signal_rr,
+            tp_rr_override=0.0,   # filled by _apply_policy with actual signal_rr
         )
 
     # -------------------------------------------------------------------------
@@ -291,59 +323,49 @@ class HTFFilter:
     def _apply_policy(self, base: HTFResult,
                       signal_direction: int,
                       signal_rr: float) -> HTFResult:
-        """Apply STRICT / LENIENT / ranging policy to a computed HTFResult."""
         trend = base.trend
 
-        # Ranging market
         if trend == 0:
             if self._skip_ranging:
                 return self._clone(base,
-                                   skipped=True,
-                                   skip_reason=(
-                                       f"Ranging market — price inside "
-                                       f"Ichimoku cloud "
-                                       f"(top={base.cloud_top:.5f}  "
-                                       f"bottom={base.cloud_bottom:.5f})"
-                                   ),
-                                   tp_rr_override=signal_rr)
-            else:
-                # Treat ranging as neutral — pass through unchanged
-                return self._clone(base,
-                                   with_trend=True, counter_trend=False,
-                                   skipped=False, skip_reason="",
-                                   tp_rr_override=signal_rr)
+                    skipped=True,
+                    skip_reason=(
+                        f"Ranging — price inside Ichimoku cloud "
+                        f"(top={base.cloud_top:.5f} "
+                        f"bottom={base.cloud_bottom:.5f})"
+                    ),
+                    tp_rr_override=signal_rr)
+            return self._clone(base,
+                with_trend=True, counter_trend=False,
+                skipped=False, skip_reason="",
+                tp_rr_override=signal_rr)
 
-        # Trending market
-        with_trend    = (signal_direction == trend)
-        counter_trend = not with_trend
-        d_str         = "LONG" if signal_direction > 0 else "SHORT"
-        trend_str     = base.trend_label
+        with_trend = (signal_direction == trend)
 
         if with_trend:
             return self._clone(base,
-                               with_trend=True, counter_trend=False,
-                               skipped=False, skip_reason="",
-                               tp_rr_override=signal_rr)
+                with_trend=True, counter_trend=False,
+                skipped=False, skip_reason="",
+                tp_rr_override=signal_rr)
 
-        # Counter-trend
+        d_str = "LONG" if signal_direction > 0 else "SHORT"
         if self._strict:
             reason = (
                 f"Counter-trend: signal is {d_str} but "
-                f"HTF {self._htf_tf.upper()} is {trend_str} "
+                f"HTF {self._htf_tf.upper()} is {base.trend_label} "
                 f"(close={base.htf_close:.5f}  "
                 f"cloud_top={base.cloud_top:.5f}  "
                 f"cloud_bottom={base.cloud_bottom:.5f})"
             )
             return self._clone(base,
-                               with_trend=False, counter_trend=True,
-                               skipped=True, skip_reason=reason,
-                               tp_rr_override=signal_rr)
+                with_trend=False, counter_trend=True,
+                skipped=True, skip_reason=reason,
+                tp_rr_override=signal_rr)
         else:
-            # LENIENT: allow with reduced TP
             return self._clone(base,
-                               with_trend=False, counter_trend=True,
-                               skipped=False, skip_reason="",
-                               tp_rr_override=self._ct_rr)
+                with_trend=False, counter_trend=True,
+                skipped=False, skip_reason="",
+                tp_rr_override=self._ct_rr)
 
     # -------------------------------------------------------------------------
     # Helpers

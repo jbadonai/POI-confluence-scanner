@@ -99,9 +99,9 @@ class TelegramNotifier:
             size_line = ""
             if lot_size and notional and leverage:
                 size_line = (
-                    f"\n📦 Qty      : <code>{lot_size}</code> contracts"
-                    f"\n💵 Notional : <code>{fp(notional)} USDT</code>"
-                    f"\n⚙️  Leverage : <code>{leverage}x</code>"
+                    f"\n📦 Qty         : <code>{lot_size}</code> contracts"
+                    f"\n💵 Order Value : <code>{fp(notional)} USDT</code>"
+                    f"\n⚙️  Leverage    : <code>{leverage}x</code>"
                 )
             chart_line = ""   # no chart link on executed trades (already in)
         else:
@@ -114,6 +114,18 @@ class TelegramNotifier:
                 chart_line = f"\n\n📈 <a href=\"{url}\">Open {sig.symbol} chart on TradingView</a>"
             else:
                 chart_line = ""
+
+        # POI zone coordinates
+        coords = getattr(sig, "zone_coords", None)
+        coords_line = ""
+        if coords:
+            coords_lines = []
+            for lbl, top, bot in coords:
+                coords_lines.append(
+                    f"  <code>{lbl:<6}</code> "
+                    f"<code>{fp(top)}</code> — <code>{fp(bot)}</code>"
+                )
+            coords_line = "\n\n📍 <b>POI Zones:</b>\n" + "\n".join(coords_lines)
 
         return (
             f"{header}\n"
@@ -131,6 +143,7 @@ class TelegramNotifier:
             f"\n"
             f"⏰ Candle : {bar_str}\n"
             f"🔢 Active zones : {sig.active_zones}"
+            f"{coords_line}"
             f"{chart_line}"
         )
 
@@ -165,12 +178,12 @@ class TelegramNotifier:
     async def send_trade_executed(self, sig: SignalInfo,
                                   order_id: str,
                                   lot_size: float,
-                                  notional: float,
+                                  order_value: float,
                                   leverage: int):
         """Confirmation message after a Bybit order is placed."""
         await self._send(self._build_signal_msg(
             sig, order_id=order_id,
-            lot_size=lot_size, notional=notional, leverage=leverage,
+            lot_size=lot_size, notional=order_value, leverage=leverage,
         ))
 
     async def send_trade_failed(self, sig: SignalInfo, reason: str):

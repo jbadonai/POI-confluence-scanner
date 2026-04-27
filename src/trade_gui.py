@@ -392,8 +392,8 @@ class TradeGUI:
         self._entry_var = tk.StringVar()
         self._sl_var    = tk.StringVar()
         self._tp_var    = tk.StringVar()
-        self._lev_var   = tk.StringVar()
-        self._qty_var   = tk.StringVar()
+        self._order_value_var = tk.StringVar()
+        self._qty_var         = tk.StringVar()
         self._risk_var  = tk.StringVar(value="")
         self._rr_var    = tk.StringVar(value="")
 
@@ -401,23 +401,43 @@ class TradeGUI:
         row("Stop Loss",self._sl_var,  self._risk_var, "risk")
         row("Take Profit",self._tp_var,self._rr_var,   "rr")
 
-        # Leverage row with "Max" button
-        f_lev = tk.Frame(parent, bg=C["panel"])
-        f_lev.pack(fill="x", **PAD)
-        tk.Label(f_lev, text=f"{'Leverage':<10}", bg=C["panel"],
+        # ── Order Value section ──────────────────────────────────────────────
+        _label(parent, "  Order Value Mode", fg=C["blue"], font=FONT_BOLD).pack(
+               anchor="w", padx=14, pady=(6, 2))
+
+        self._ov_mode = tk.StringVar(value="manual")
+        ov_mode_row = tk.Frame(parent, bg=C["panel"])
+        ov_mode_row.pack(fill="x", padx=18, pady=2)
+        for val, lbl in [("manual",   "Manual (USDT)"),
+                          ("max_lev",  "Max Leverage"),
+                          ("half_lev", "½ Max Leverage")]:
+            tk.Radiobutton(
+                ov_mode_row, text=lbl, variable=self._ov_mode, value=val,
+                command=self._on_ov_mode_change,
+                bg=C["panel"], fg=C["text"], selectcolor=C["card"],
+                activebackground=C["panel"], activeforeground=C["text"],
+                font=FONT_LABEL, cursor="hand2",
+            ).pack(side="left", padx=(0, 14))
+
+        f_ov = tk.Frame(parent, bg=C["panel"])
+        f_ov.pack(fill="x", **PAD)
+        tk.Label(f_ov, text=f"{'Order Val':<10}", bg=C["panel"],
                  fg=C["dim"], font=FONT_LABEL, width=10, anchor="w").pack(side="left")
-        _entry(f_lev, textvariable=self._lev_var, width=16).pack(side="left", padx=(4, 0))
-        self._max_lev_btn = _btn(
-            f_lev, "Max", self._fetch_max_leverage,
+        self._ov_entry = _entry(f_ov, textvariable=self._order_value_var, width=16)
+        self._ov_entry.pack(side="left", padx=(4, 0))
+        tk.Label(f_ov, text="USDT", bg=C["panel"],
+                 fg=C["dim"], font=FONT_SMALL).pack(side="left", padx=(4, 0))
+        # Fetch button (visible for max_lev / half_lev modes)
+        self._ov_fetch_btn = _btn(
+            f_ov, "Fetch", self._fetch_order_value,
             C["btn_sec"], C["btn_sec_h"], C["dim"],
             font=FONT_SMALL, padx=6, pady=2,
         )
-        self._max_lev_btn.pack(side="left", padx=(6, 0))
-        self._max_lev_info = tk.Label(
-            f_lev, text="", bg=C["panel"],
-            fg=C["yellow"], font=FONT_SMALL,
-        )
-        self._max_lev_info.pack(side="left", padx=(6, 0))
+        self._ov_fetch_btn.pack(side="left", padx=(6, 0))
+        self._ov_fetch_btn.pack_forget()   # hidden by default (manual mode)
+        self._ov_info = tk.Label(
+            f_ov, text="", bg=C["panel"], fg=C["yellow"], font=FONT_SMALL)
+        self._ov_info.pack(side="left", padx=(6, 0))
 
         f_qty = tk.Frame(parent, bg=C["panel"])
         f_qty.pack(fill="x", **PAD)
@@ -445,7 +465,7 @@ class TradeGUI:
                 self._user_edited = True
                 self._reset_btn.config(state="normal")   # enable Reset button
         for v in (self._entry_var, self._sl_var, self._tp_var,
-                  self._lev_var, self._qty_var):
+                  self._order_value_var, self._qty_var):
             v.trace_add("write", _mark_edited)
 
         _sep(parent).pack(fill="x", padx=14, pady=6)
@@ -666,7 +686,8 @@ class TradeGUI:
             self._entry_var.set(self._fmt_price(sig.entry))
             self._sl_var.set(self._fmt_price(sig.sl))
             self._tp_var.set(self._fmt_price(sig.tp))
-            self._lev_var.set(str(self.cfg.get("bybit_fixed_leverage", 10)))
+            self._order_value_var.set(
+                str(self.cfg.get("bybit_manual_order_value", 10.0)))
             self._recalc_qty()
 
             # Update TradingView chart link
@@ -697,20 +718,33 @@ class TradeGUI:
         self._populating = True
         try:
             for v in (self._entry_var, self._sl_var, self._tp_var,
-                      self._lev_var, self._qty_var, self._risk_var, self._rr_var):
+                      self._order_value_var, self._qty_var,
+                      self._risk_var, self._rr_var):
                 v.set("")
         finally:
             self._populating = False
 
-    def _fetch_max_leverage(self):
-        """Query Bybit for the maximum leverage of the selected pair and fill the field."""
+    def _on_ov_mode_change(self):
+        """Toggle entry editability and Fetch button based on OV mode."""
+        mode = self._ov_mode.get()
+        if mode == "manual":
+            self._ov_entry.config(state="normal")
+            self._ov_fetch_btn.pack_forget()
+            self._ov_info.config(text="")
+        else:
+            self._ov_entry.config(state="readonly")
+            self._ov_fetch_btn.pack(side="left", padx=(6, 0))
+            self._ov_info.config(text="click Fetch", fg=C["dim"])
+
+    def _fetch_order_value(self):
+        """Fetch max leverage from Bybit and compute order value per selected mode."""
         if not self._selected_key or self._selected_key not in self._signals:
             self._set_status("Select a signal first.", C["yellow"])
             return
-        sym = self._signals[self._selected_key].sig.symbol
-
-        self._max_lev_btn.config(state="disabled", text="...")
-        self._max_lev_info.config(text="fetching...")
+        sym  = self._signals[self._selected_key].sig.symbol
+        mode = self._ov_mode.get()
+        self._ov_fetch_btn.config(state="disabled", text="...")
+        self._ov_info.config(text="fetching...", fg=C["dim"])
 
         def _do():
             try:
@@ -721,23 +755,31 @@ class TradeGUI:
 
         def _done(future):
             max_lev, err = future.result()
-            self.root.after(0, lambda: self._on_max_lev(sym, max_lev, err))
+            self.root.after(0, lambda: self._on_ov_fetched(sym, max_lev, err, mode))
 
-        fut = self._pool.submit(_do)
-        fut.add_done_callback(_done)
+        self._pool.submit(_do).add_done_callback(_done)
 
-    def _on_max_lev(self, sym: str, max_lev, err):
-        self._max_lev_btn.config(state="normal", text="Max")
+    def _on_ov_fetched(self, sym: str, max_lev, err, mode: str):
+        self._ov_fetch_btn.config(state="normal", text="Fetch")
         if err:
-            self._max_lev_info.config(text=f"error", fg=C["red"])
-            self._set_status(f"Max leverage fetch failed: {err}", C["red"])
-        else:
-            self._lev_var.set(str(max_lev))
-            self._max_lev_info.config(
-                text=f"max={max_lev}x", fg=C["yellow"])
-            self._recalc_qty()
-            self._set_status(
-                f"{sym} max leverage: {max_lev}x — applied.", C["green"])
+            self._ov_info.config(text="error", fg=C["red"])
+            self._set_status(f"Leverage fetch failed: {err}", C["red"])
+            return
+        if mode == "max_lev":
+            order_value = float(max_lev)
+            label = f"max={max_lev}x → {order_value:.0f} USDT"
+        else:   # half_lev
+            import math as _math
+            order_value = float(_math.floor(max_lev / 2))
+            label = f"max={max_lev}x → ½={order_value:.0f} USDT"
+        self._populating = True
+        try:
+            self._order_value_var.set(str(order_value))
+        finally:
+            self._populating = False
+        self._ov_info.config(text=label, fg=C["yellow"])
+        self._recalc_qty()
+        self._set_status(f"{sym} order value set to {order_value:.0f} USDT ({mode})", C["green"])
 
     def _reset_to_signal(self):
         """Force-repopulate all fields from the original signal values."""
@@ -757,30 +799,33 @@ class TradeGUI:
                 logger.warning(f"Could not open browser: {e}")
 
     def _recalc_qty(self):
-        """Auto-recalculate Qty from entry/SL and config risk settings."""
+        """
+        Auto-recalculate Qty from order_value / entry_price.
+        Qty = order_value_usdt / entry_price (rounded to 3 dp as estimate).
+        """
         try:
-            entry    = float(self._entry_var.get())
-            sl       = float(self._sl_var.get())
-            leverage = float(self._lev_var.get() or
-                             self.cfg.get("bybit_fixed_leverage", 10))
-            sl_pct   = abs(entry - sl) / entry
-            if sl_pct <= 0:
+            entry       = float(self._entry_var.get())
+            order_value = float(self._order_value_var.get() or
+                                self.cfg.get("bybit_manual_order_value", 10.0))
+            if entry <= 0 or order_value <= 0:
                 return
-            risk_usd  = float(self.cfg.get("bybit_risk_usd", 50.0))
-            notional  = risk_usd / sl_pct
-            raw_qty   = notional / entry
-            # Simple rounding (full precision from API not available here)
-            qty = round(raw_qty, 3)
+            raw_qty = order_value / entry
+            qty     = round(raw_qty, 3)
             self._qty_var.set(str(qty))
 
-            # Info labels
-            self._risk_var.set(
-                f"  risk ~{sl_pct:.3%}  "
-                f"margin ~{notional/leverage:.2f} USDT")
+            # Margin info (for display only — actual margin set by Bybit's max leverage)
+            sl_str = self._sl_var.get()
+            if sl_str:
+                sl    = float(sl_str)
+                sl_pct = abs(entry - sl) / entry if entry > 0 else 0
+                self._risk_var.set(
+                    f"  order_val={order_value:.0f} USDT  "
+                    f"sl~{sl_pct:.3%}")
 
             # TP RR
             try:
                 tp   = float(self._tp_var.get())
+                sl   = float(self._sl_var.get())
                 tp_d = abs(entry - tp)
                 sl_d = abs(entry - sl)
                 rr   = tp_d / sl_d if sl_d > 0 else 0
@@ -810,11 +855,11 @@ class TradeGUI:
 
         # Read current field values
         try:
-            entry    = float(self._entry_var.get())
-            sl_price = float(self._sl_var.get())
-            tp_price = float(self._tp_var.get())
-            leverage = int(float(self._lev_var.get()))
-            qty      = float(self._qty_var.get())
+            entry       = float(self._entry_var.get())
+            sl_price    = float(self._sl_var.get())
+            tp_price    = float(self._tp_var.get())
+            order_value = float(self._order_value_var.get())
+            qty         = float(self._qty_var.get())
         except ValueError as e:
             self._set_status(f"Invalid value: {e}", C["red"])
             return
@@ -839,8 +884,9 @@ class TradeGUI:
 
         def _do_place():
             try:
-                # Step 1: Set leverage
-                self._bybit.ensure_leverage(sig.symbol, leverage)
+                # Step 1: Get max leverage and set it (always max for all trades)
+                max_leverage = self._bybit.get_max_leverage(sig.symbol)
+                self._bybit.set_max_leverage(sig.symbol, max_leverage)
 
                 # Step 2: Round qty to Bybit precision
                 rounded_qty = self._bybit.round_qty(qty, sig.symbol)
@@ -883,13 +929,12 @@ class TradeGUI:
 
                 # Record in trades.db for direct mode
                 if mode == "direct":
-                    notional = qty * entry
                     self.store.record(
                         symbol=sig.symbol, direction=sig.direction,
                         bar_time=sig.bar_time, zone_src=sig.zone_src,
                         entry=entry, sl=sl_price, tp=tp_price,
-                        qty=rounded_qty, notional=notional,
-                        risk_usd=self.cfg.get("bybit_risk_usd", 50.0),
+                        qty=rounded_qty, notional=order_value,
+                        risk_usd=order_value,
                         bybit_order_id=bybit_id,
                         order_link_id=f"MGUI_{sig.symbol}_{sig.bar_time}_{side[0]}",
                         status="PLACED",
@@ -904,14 +949,14 @@ class TradeGUI:
             bybit_id, err = future.result()
             self.root.after(0, lambda: self._after_place(
                 sig, bybit_id, err, entry, sl_price, tp_price,
-                qty, leverage, order_type, trigger
+                qty, order_value, order_type, trigger
             ))
 
         fut = self._pool.submit(_do_place)
         fut.add_done_callback(_on_done)
 
     def _after_place(self, sig, bybit_id, err,
-                     entry, sl, tp, qty, leverage, order_type, trigger):
+                     entry, sl, tp, qty, order_value, order_type, trigger):
         self._place_btn.config(state="normal")
         if err:
             self._set_status(f"FAILED: {err}", C["red"])
@@ -938,8 +983,8 @@ class TradeGUI:
                 asyncio.run_coroutine_threadsafe(
                     self.notifier.send_trade_executed(
                         notif_sig, order_id=bybit_id,
-                        lot_size=qty, notional=qty * entry,
-                        leverage=leverage,
+                        lot_size=qty, order_value=order_value,
+                        leverage=0,
                     ),
                     self.loop,
                 )

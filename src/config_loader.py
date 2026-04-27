@@ -59,22 +59,14 @@ def load_config(path: str = 'config.ini') -> Dict[str, Any]:
         'bybit_api_key':            s('BYBIT', 'api_key'),
         'bybit_api_secret':         s('BYBIT', 'api_secret'),
         'bybit_testnet':            b('BYBIT', 'testnet', False),
+        'bybit_base_url':           s('BYBIT', 'base_url', 'https://api.bybit.com'),
+        'bybit_manual_order_value': f('BYBIT', 'manual_order_value', 10.0),
         'bybit_auto_trade':         b('BYBIT', 'auto_trade', True),
-        'bybit_use_max_leverage':   b('BYBIT', 'use_max_leverage', True),
-        'bybit_fixed_leverage':     i('BYBIT', 'fixed_leverage', 10),
-        'bybit_sizing_mode':        s('BYBIT', 'sizing_mode', 'FIXED_RISK').upper(),
-        'bybit_risk_usd':           f('BYBIT', 'risk_usd', 50.0),
-        'bybit_pct_balance':        f('BYBIT', 'pct_balance', 2.0),
-        'bybit_taker_fee':          f('BYBIT', 'taker_fee', 0.00055),
         'bybit_max_concurrent_trades': i('BYBIT', 'max_concurrent_trades', 5),
         'bybit_notify_failures':     b('BYBIT', 'notify_failures', True),
         'bybit_order_type':         s('BYBIT', 'order_type', 'MARKET').upper(),
-        'bybit_slippage_tolerance': f('BYBIT', 'slippage_tolerance', 0.001),
         'bybit_sl_trigger':         sl_trigger,
         'bybit_tp_trigger':         tp_trigger,
-        # Safety bounds — not exposed in config (sane defaults)
-        'bybit_min_notional':  5.0,
-        'bybit_max_notional':  500_000.0,
 
         # -- General -----------------------------------------------------------
         'mitigation': s('GENERAL', 'mitigation', 'CLOSE_BEYOND').upper(),
@@ -112,11 +104,6 @@ def load_config(path: str = 'config.ini') -> Dict[str, Any]:
         'pip_size':    f('TRADE', 'pip_size', 1.0),
 
         # -- Legacy position sizing (alert-only mode) --------------------------
-        'ps_enabled':   b('POSITION_SIZING', 'enabled', True),
-        'ps_risk':      f('POSITION_SIZING', 'risk', 50.0),
-        'ps_pip_value': f('POSITION_SIZING', 'pip_value', 1.0),
-        'ps_min_lot':   f('POSITION_SIZING', 'min_lot', 0.001),
-        'ps_lot_step':  f('POSITION_SIZING', 'lot_step', 0.001),
 
         # -- HTF trend filter (Ichimoku Cloud) ---------------------------------
         'htf_enabled':          b('HTF_FILTER', 'enabled',          False),
@@ -157,9 +144,6 @@ def load_config(path: str = 'config.ini') -> Dict[str, Any]:
             errors.append("BYBIT api_key must be set when auto_trade = true")
         if not cfg['bybit_api_secret'] or 'YOUR_' in cfg['bybit_api_secret']:
             errors.append("BYBIT api_secret must be set when auto_trade = true")
-        if cfg['bybit_sizing_mode'] not in {'FIXED_RISK', 'PCT_BALANCE'}:
-            errors.append(f"Invalid bybit sizing_mode: {cfg['bybit_sizing_mode']}")
-
     if errors:
         raise ValueError("Config errors:\n  " + "\n  ".join(errors))
 

@@ -230,7 +230,7 @@ class Scanner:
                 sig,
                 order_id = result["order_id"],
                 lot_size = result["qty"],
-                notional = result["notional"],
+                order_value = result.get("order_value", 0),
                 leverage = result["leverage"],
             )
         except Exception as e:

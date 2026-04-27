@@ -436,20 +436,16 @@ def _build_signal(symbol: str, df: pd.DataFrame,
     sl_pips = int(round(risk             * _pip_mult))
     tp_pips = int(round(risk * cfg['tp_rr'] * _pip_mult))
 
+    # Lot size estimate for Telegram alert display.
+    # Actual qty is determined at order placement: order_value / entry_price.
+    # order_value = manual_order_value (GUI/alert mode) or floor(max_lev/2) (auto mode).
     lot_size = None
     lot_info = "N/A"
-    if cfg['ps_enabled'] and risk > 0:
-        # Legacy alert-only sizing: risk_$ / (sl_dist * pip_value_per_unit)
-        pip_value = cfg.get('ps_pip_value', 1.0)
-        raw     = cfg['ps_risk'] / (risk * pip_value) if pip_value > 0 else 0
-        step    = cfg['ps_lot_step']
-        if raw > 0 and step > 0:
-            stepped = round(int(raw / step) * step, 8)
-            if stepped < cfg['ps_min_lot']:
-                lot_info = f"below min ({cfg['ps_min_lot']} lots)"
-            else:
-                lot_size = round(stepped, 4)
-                lot_info = f"{lot_size} lots"
+    order_value = float(cfg.get('bybit_manual_order_value', 10.0))
+    if en > 0 and order_value > 0:
+        raw_qty  = order_value / en
+        lot_size = round(raw_qty, 4)
+        lot_info = f"~{lot_size} @ {order_value:.0f} USDT order value"
 
     # Determine which zone types triggered the rejection
     opens  = df['open'].values
@@ -473,6 +469,26 @@ def _build_signal(symbol: str, df: pd.DataFrame,
         if triggered:
             zone_src = src_or(zone_src, z.src)
 
+    # Collect zone coordinates for triggered zones
+    zone_coords = []
+    _label_map = {1: "OB", 2: "OC", 4: "LS", 3: "OB+OC", 5: "OB+LS",
+                  6: "OC+LS", 7: "OB+OC+LS"}
+    for z in zl.zones:
+        zt, zb, zd = z.top, z.bottom, z.direction
+        triggered = False
+        if is_bull and zd > 0:
+            if   mode == 'WICK_IN_CLOSE_OUT' and lows[ci]  <= zt and closes[ci] > zt:  triggered = True
+            elif mode == 'ANY_TOUCH'          and lows[ci]  <= zt and highs[ci] >= zb:  triggered = True
+            elif mode == 'CLOSE_INSIDE'       and zb <= closes[ci] <= zt:               triggered = True
+        elif not is_bull and zd < 0:
+            if   mode == 'WICK_IN_CLOSE_OUT' and highs[ci] >= zb and closes[ci] < zb:  triggered = True
+            elif mode == 'ANY_TOUCH'          and highs[ci] >= zb and lows[ci]  <= zt:  triggered = True
+            elif mode == 'CLOSE_INSIDE'       and zb <= closes[ci] <= zt:               triggered = True
+        if triggered:
+            src_bits = z.src
+            lbl = _label_map.get(src_bits, src_text(src_bits))
+            zone_coords.append((lbl, round(zt, 8), round(zb, 8)))
+
     return SignalInfo(
         symbol=symbol,
         direction=+1 if is_bull else -1,
@@ -483,6 +499,7 @@ def _build_signal(symbol: str, df: pd.DataFrame,
         rr=cfg['tp_rr'],
         bar_time=bar_time,
         active_zones=len(zl.zones),
+        zone_coords=zone_coords if zone_coords else None,
     )
 
 
