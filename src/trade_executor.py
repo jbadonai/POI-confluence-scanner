@@ -135,10 +135,18 @@ class TradeExecutor:
                 self._record(sig, "FAILED", note=reason)
                 return {"order_id": None, "failure": reason}
 
-            # Step 7: order value = floor(max_leverage / 2) USDT
-            _, order_value = self.bybit.get_order_value(sym)
-            logger.info(f"{tag} order_value={order_value:.0f} USDT  "
-                        f"leverage={max_leverage}x")
+            # Step 7: resolve order value
+            # use_manual_order_value = true  -> use fixed manual_order_value USDT
+            # use_manual_order_value = false -> floor(max_leverage * multiplier) USDT
+            if self.cfg.get('bybit_use_manual_order_value', False):
+                order_value = float(self.cfg.get('bybit_manual_order_value', 10.0))
+                logger.info(f"{tag} order_value={order_value:.0f} USDT  "
+                            f"(manual)  leverage={max_leverage}x")
+            else:
+                mult = float(self.cfg.get('bybit_order_value_multiplier', 0.5))
+                _, order_value = self.bybit.get_order_value(sym, multiplier=mult)
+                logger.info(f"{tag} order_value={order_value:.0f} USDT  "
+                            f"({mult}x max_lev)  leverage={max_leverage}x")
 
             # Optional margin check against cycle balance
             margin_required = order_value / max_leverage

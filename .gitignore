@@ -9,4 +9,5 @@ build/
 __pycache__/
 temp/
 .idea/
+backup/
 

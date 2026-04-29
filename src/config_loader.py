@@ -60,7 +60,9 @@ def load_config(path: str = 'config.ini') -> Dict[str, Any]:
         'bybit_api_secret':         s('BYBIT', 'api_secret'),
         'bybit_testnet':            b('BYBIT', 'testnet', False),
         'bybit_base_url':           s('BYBIT', 'base_url', 'https://api.bybit.com'),
-        'bybit_manual_order_value': f('BYBIT', 'manual_order_value', 10.0),
+        'bybit_use_manual_order_value': b('BYBIT', 'use_manual_order_value', False),
+        'bybit_manual_order_value':     f('BYBIT', 'manual_order_value', 10.0),
+        'bybit_order_value_multiplier': f('BYBIT', 'order_value_multiplier', 0.5),
         'bybit_auto_trade':         b('BYBIT', 'auto_trade', True),
         'bybit_max_concurrent_trades': i('BYBIT', 'max_concurrent_trades', 5),
         'bybit_notify_failures':     b('BYBIT', 'notify_failures', True),
@@ -104,6 +106,11 @@ def load_config(path: str = 'config.ini') -> Dict[str, Any]:
         'pip_size':    f('TRADE', 'pip_size', 1.0),
 
         # -- Legacy position sizing (alert-only mode) --------------------------
+
+        # -- OB/OS confirmation filter ----------------------------------------
+        'obos_enabled': b('OBOS_FILTER', 'enabled', False),
+        'obos_length':  i('OBOS_FILTER', 'length',  5),
+        'obos_window':  i('OBOS_FILTER', 'window',  5),
 
         # -- HTF trend filter (Ichimoku Cloud) ---------------------------------
         'htf_enabled':          b('HTF_FILTER', 'enabled',          False),

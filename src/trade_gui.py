@@ -405,19 +405,53 @@ class TradeGUI:
         _label(parent, "  Order Value Mode", fg=C["blue"], font=FONT_BOLD).pack(
                anchor="w", padx=14, pady=(6, 2))
 
-        self._ov_mode = tk.StringVar(value="manual")
-        ov_mode_row = tk.Frame(parent, bg=C["panel"])
-        ov_mode_row.pack(fill="x", padx=18, pady=2)
-        for val, lbl in [("manual",   "Manual (USDT)"),
-                          ("max_lev",  "Max Leverage"),
-                          ("half_lev", "½ Max Leverage")]:
+        # Determine default mode from config
+        _default_ov_mode = (
+            "manual" if self.cfg.get("bybit_use_manual_order_value", False)
+            else "multiplier"
+        )
+        self._ov_mode = tk.StringVar(value=_default_ov_mode)
+
+        # Row 1: Manual vs Multiplier toggle
+        ov_row1 = tk.Frame(parent, bg=C["panel"])
+        ov_row1.pack(fill="x", padx=18, pady=(2, 0))
+        for val, lbl in [("manual",     "Manual (USDT)"),
+                          ("multiplier", "× Max Leverage")]:
             tk.Radiobutton(
-                ov_mode_row, text=lbl, variable=self._ov_mode, value=val,
+                ov_row1, text=lbl, variable=self._ov_mode, value=val,
                 command=self._on_ov_mode_change,
                 bg=C["panel"], fg=C["text"], selectcolor=C["card"],
                 activebackground=C["panel"], activeforeground=C["text"],
                 font=FONT_LABEL, cursor="hand2",
-            ).pack(side="left", padx=(0, 14))
+            ).pack(side="left", padx=(0, 18))
+
+        # Row 2: Multiplier quick-select buttons (visible in multiplier mode)
+        self._ov_mult_row = tk.Frame(parent, bg=C["panel"])
+        self._ov_mult_row.pack(fill="x", padx=18, pady=(2, 0))
+        self._ov_mult_var = tk.DoubleVar(
+            value=float(self.cfg.get("bybit_order_value_multiplier", 0.5)))
+        _mult_lbl = tk.Label(self._ov_mult_row, text="Multiplier:",
+                              bg=C["panel"], fg=C["dim"], font=FONT_SMALL)
+        _mult_lbl.pack(side="left", padx=(0, 6))
+        for mult, label in [(0.25,"¼×"),(0.5,"½×"),(0.75,"¾×"),
+                             (1.0,"1×"),(1.5,"1.5×"),(2.0,"2×"),(3.0,"3×")]:
+            btn = _btn(
+                self._ov_mult_row, label,
+                lambda m=mult: self._set_mult(m),
+                C["btn_sec"], C["btn_sec_h"], C["dim"],
+                font=FONT_SMALL, padx=5, pady=2,
+            )
+            btn.pack(side="left", padx=2)
+        # Custom multiplier entry
+        tk.Label(self._ov_mult_row, text="Custom:",
+                  bg=C["panel"], fg=C["dim"], font=FONT_SMALL).pack(
+                  side="left", padx=(8, 2))
+        self._ov_mult_entry = _entry(
+            self._ov_mult_row, textvariable=self._ov_mult_var, width=5)
+        self._ov_mult_entry.pack(side="left")
+        tk.Label(self._ov_mult_row, text="× max_lev",
+                  bg=C["panel"], fg=C["dim"], font=FONT_SMALL).pack(
+                  side="left", padx=(2, 0))
 
         f_ov = tk.Frame(parent, bg=C["panel"])
         f_ov.pack(fill="x", **PAD)
@@ -725,16 +759,24 @@ class TradeGUI:
             self._populating = False
 
     def _on_ov_mode_change(self):
-        """Toggle entry editability and Fetch button based on OV mode."""
+        """Toggle entry/multiplier row visibility based on OV mode."""
         mode = self._ov_mode.get()
         if mode == "manual":
             self._ov_entry.config(state="normal")
             self._ov_fetch_btn.pack_forget()
+            self._ov_mult_row.pack_forget()
             self._ov_info.config(text="")
         else:
             self._ov_entry.config(state="readonly")
+            self._ov_mult_row.pack(fill="x", padx=18, pady=(2, 0))
             self._ov_fetch_btn.pack(side="left", padx=(6, 0))
             self._ov_info.config(text="click Fetch", fg=C["dim"])
+
+    def _set_mult(self, mult: float):
+        """Set multiplier variable and trigger fetch if a pair is selected."""
+        self._ov_mult_var.set(mult)
+        if self._selected_key and self._selected_key in self._signals:
+            self._fetch_order_value()
 
     def _fetch_order_value(self):
         """Fetch max leverage from Bybit and compute order value per selected mode."""
@@ -765,13 +807,10 @@ class TradeGUI:
             self._ov_info.config(text="error", fg=C["red"])
             self._set_status(f"Leverage fetch failed: {err}", C["red"])
             return
-        if mode == "max_lev":
-            order_value = float(max_lev)
-            label = f"max={max_lev}x → {order_value:.0f} USDT"
-        else:   # half_lev
-            import math as _math
-            order_value = float(_math.floor(max_lev / 2))
-            label = f"max={max_lev}x → ½={order_value:.0f} USDT"
+        import math as _math
+        mult        = float(self._ov_mult_var.get())
+        order_value = float(_math.floor(max_lev * mult))
+        label       = f"max={max_lev}x × {mult} = {order_value:.0f} USDT"
         self._populating = True
         try:
             self._order_value_var.set(str(order_value))
@@ -779,7 +818,8 @@ class TradeGUI:
             self._populating = False
         self._ov_info.config(text=label, fg=C["yellow"])
         self._recalc_qty()
-        self._set_status(f"{sym} order value set to {order_value:.0f} USDT ({mode})", C["green"])
+        self._set_status(
+            f"{sym} order value = {order_value:.0f} USDT ({mult}× max leverage)", C["green"])
 
     def _reset_to_signal(self):
         """Force-repopulate all fields from the original signal values."""
@@ -881,6 +921,9 @@ class TradeGUI:
         order_cfg["bybit_order_type"]  = order_type
         order_cfg["bybit_sl_trigger"]  = trigger
         order_cfg["bybit_tp_trigger"]  = trigger
+
+        ov_mode = self._ov_mode.get()
+        ov_mult = float(self._ov_mult_var.get())
 
         def _do_place():
             try:

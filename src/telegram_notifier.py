@@ -115,6 +115,14 @@ class TelegramNotifier:
             else:
                 chart_line = ""
 
+        # OB/OS confirmation line
+        obos_ago = getattr(sig, "obos_bars_ago", None)
+        obos_line = ""
+        if obos_ago is not None:
+            bars_str = "current bar" if obos_ago == 0 else f"{obos_ago} bar{'s' if obos_ago > 1 else ''} ago"
+            d_word   = "Buy crossover" if sig.direction > 0 else "Sell crossunder"
+            obos_line = f"\n📊 <b>OB/OS</b> : {d_word} confirmed ({bars_str})"
+
         # POI zone coordinates
         coords = getattr(sig, "zone_coords", None)
         coords_line = ""
@@ -143,6 +151,7 @@ class TelegramNotifier:
             f"\n"
             f"⏰ Candle : {bar_str}\n"
             f"🔢 Active zones : {sig.active_zones}"
+            f"{obos_line}"
             f"{coords_line}"
             f"{chart_line}"
         )

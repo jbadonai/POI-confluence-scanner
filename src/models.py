@@ -52,3 +52,4 @@ class SignalInfo:
     # POI zone coordinates: list of (label, top, bottom) tuples
     # e.g. [("OB", 1.3320, 1.3310), ("LS", 1.3325, 1.3308)]
     zone_coords:    object = None  # list of (label, top, bottom) or None
+    obos_bars_ago:  object = None  # int bars ago OB/OS crossover fired, or None

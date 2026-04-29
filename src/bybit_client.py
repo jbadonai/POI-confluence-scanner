@@ -299,19 +299,25 @@ class BybitClient:
     # Order value sizing
     # -------------------------------------------------------------------------
 
-    def get_order_value(self, symbol: str) -> Tuple[int, float]:
+    def get_order_value(self, symbol: str,
+                        multiplier: float = 0.5) -> Tuple[int, float]:
         """
         Determine max leverage and order value for a symbol.
 
-        Order value (USDT notional) = floor(max_leverage / 2)
-        e.g. max_leverage=100 -> order_value=50 USDT
-             max_leverage=75  -> order_value=37 USDT (floor)
+        order_value (USDT) = floor(max_leverage * multiplier)
+
+        Examples (multiplier examples):
+            0.5  -> half of max leverage (default)  100x -> 50 USDT
+            1.0  -> full max leverage               100x -> 100 USDT
+            0.25 -> quarter max leverage            100x -> 25 USDT
+            2.0  -> double max leverage             100x -> 200 USDT
 
         Returns (max_leverage, order_value_usdt).
         """
         max_lev     = self.get_max_leverage(symbol)
-        order_value = math.floor(max_lev / 2.0)
+        order_value = math.floor(max_lev * multiplier)
         logger.info(f"[{symbol}] max_leverage={max_lev}x  "
+                    f"multiplier={multiplier}x  "
                     f"order_value={order_value} USDT")
         return max_lev, float(order_value)
 

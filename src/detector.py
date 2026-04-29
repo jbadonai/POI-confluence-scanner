@@ -18,6 +18,7 @@ from typing import List, Optional, Tuple
 import pandas as pd
 
 from .models   import ZoneData, OBState, SignalInfo
+from .obos     import last_signal as _obos_last_signal
 from .indicators import calc_wilder_atr, compute_pivot_highs, compute_pivot_lows
 
 
@@ -500,6 +501,7 @@ def _build_signal(symbol: str, df: pd.DataFrame,
         bar_time=bar_time,
         active_zones=len(zl.zones),
         zone_coords=zone_coords if zone_coords else None,
+        obos_bars_ago=None,
     )
 
 
@@ -609,5 +611,22 @@ def scan_pair(symbol: str, df: pd.DataFrame, cfg: dict) -> Optional[SignalInfo]:
         zones_hit = bin(sig.zone_src).count('1')
         if zones_hit < min_conf:
             return None
+
+    # ── OB/OS Confirmation Filter ──────────────────────────────────────────
+    # Requires an OB/OS crossover in the same direction within obos_window bars.
+    # Both sequences are valid:
+    #   Rejection first -> crossover fires within N bars
+    #   Crossover first -> rejection fires within N bars (current bar IS rejection)
+    # Signal skipped when no matching crossover found within window.
+    if cfg.get('obos_enabled', False):
+        obos_n   = int(cfg.get('obos_length', 5))
+        obos_win = int(cfg.get('obos_window', 5))
+        h_sl = highs [:ci + 1]
+        l_sl = lows  [:ci + 1]
+        c_sl = closes[:ci + 1]
+        offset, cross_dir = _obos_last_signal(h_sl, l_sl, c_sl, obos_n, obos_win)
+        if cross_dir == 0 or cross_dir != sig.direction:
+            return None
+        sig.obos_bars_ago = offset
 
     return sig
