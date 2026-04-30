@@ -145,19 +145,56 @@ def last_signal(highs: np.ndarray, lows: np.ndarray,
                 closes: np.ndarray, n: int,
                 lookback: int) -> Tuple[int, int]:
     """
-    Most recent OB/OS crossover within the last `lookback` confirmed bars.
-    Returns (bar_offset, direction): offset=0 means current bar.
+    Most recent valid OB/OS crossover within the last `lookback` confirmed bars.
+
+    Returns (bar_offset, direction):
+        bar_offset : bars ago from last bar (0 = current bar)
+        direction  : +1 buy, -1 sell, 0 = none found
+
+    Validity re-check at the REJECTION bar (last bar = index n-1):
+    ---------------------------------------------------------------
+    When the crossover fired BEFORE the rejection (offset > 0), we must
+    verify that the OB/OS lines are still on the correct side of zero AT
+    the rejection bar — not just at the original crossover bar.
+
+    Example: SELL crossunder fires above 0 (valid), but by the time the
+    rejection candle appears 3 bars later, up/down have crossed below 0.
+    That means the signal context has changed — trade is invalidated.
+
+    Re-check rules (applied at the last bar regardless of offset):
+        BUY  (direction +1): up[-1] < 0  AND  down[-1] < 0
+        SELL (direction -1): up[-1] > 0  AND  down[-1] > 0
     """
     sig      = obos_signals(highs, lows, closes, n)
     last_idx = len(closes) - 1
+
+    # Current (rejection bar) up/down values
+    up_now   = sig["up"][last_idx]
+    down_now = sig["down"][last_idx]
 
     for offset in range(lookback + 1):
         i = last_idx - offset
         if i < 0:
             break
+
         if sig["buy"][i]:
-            return offset, +1
+            # Original crossover was valid (already guaranteed by obos_signals).
+            # Re-check: are lines still below zero AT the rejection bar?
+            if np.isnan(up_now) or np.isnan(down_now):
+                return lookback + 1, 0
+            if up_now < 0 and down_now < 0:
+                return offset, +1
+            else:
+                # Lines have drifted — crossover context no longer valid
+                return lookback + 1, 0
+
         if sig["sell"][i]:
-            return offset, -1
+            # Re-check: are lines still above zero AT the rejection bar?
+            if np.isnan(up_now) or np.isnan(down_now):
+                return lookback + 1, 0
+            if up_now > 0 and down_now > 0:
+                return offset, -1
+            else:
+                return lookback + 1, 0
 
     return lookback + 1, 0
